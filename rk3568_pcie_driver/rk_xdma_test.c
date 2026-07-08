@@ -41,8 +41,27 @@ static void usage(const char *prog)
 	fprintf(stderr,
 		"Usage:\n"
 		"  %s ctrl <bar> <offset> <value>\n"
-		"  %s h2c <file> <fpga_addr_hex> [timeout_ms]\n",
-		prog, prog);
+		"  %s ctrl-read <bar> <offset>\n"
+		"  %s h2c <file> <fpga_addr> [timeout_ms]\n"
+		"  %s status\n"
+		"\n"
+		"Current zcu106_audio BD map:\n"
+		"  BAR2 offset 0 maps XDMA AXI-Lite master to FPGA AXI 0x44a00000 BRAM\n"
+		"  H2C video DDR destination should start at FPGA AXI 0x80000000\n",
+		prog, prog, prog, prog);
+}
+
+static int print_status(int fd)
+{
+	struct rk_xdma_status st;
+
+	if (ioctl(fd, RK_XDMA_IOC_STATUS, &st)) {
+		perror("status");
+		return 1;
+	}
+	printf("H2C status=0x%08x completed_desc=%u\n",
+	       st.h2c_status, st.h2c_completed_desc);
+	return 0;
 }
 
 int main(int argc, char **argv)
@@ -83,6 +102,22 @@ int main(int argc, char **argv)
 		}
 		printf("BAR%u[0x%llx] = 0x%08x\n",
 		       bar, (unsigned long long)off, readback);
+	} else if (!strcmp(argv[1], "ctrl-read")) {
+		uint32_t bar, value;
+		uint64_t off;
+
+		if (argc != 4) {
+			usage(argv[0]);
+			return 1;
+		}
+		bar = strtoul(argv[2], NULL, 0);
+		off = strtoull(argv[3], NULL, 0);
+		if (bar_read32(fd, bar, off, &value)) {
+			perror("BAR read");
+			return 1;
+		}
+		printf("BAR%u[0x%llx] = 0x%08x\n",
+		       bar, (unsigned long long)off, value);
 	} else if (!strcmp(argv[1], "h2c")) {
 		struct rk_xdma_dma_alloc alloc;
 		struct rk_xdma_h2c h2c;
@@ -131,15 +166,19 @@ int main(int argc, char **argv)
 
 		memset(&h2c, 0, sizeof(h2c));
 		h2c.bytes = fsize;
-		h2c.fpga_addr = strtoull(argv[3], NULL, 16);
+		h2c.fpga_addr = strtoull(argv[3], NULL, 0);
 		h2c.timeout_ms = argc == 5 ? strtoul(argv[4], NULL, 0) : 1000;
 		if (ioctl(fd, RK_XDMA_IOC_H2C_SUBMIT, &h2c)) {
 			perror("H2C submit");
+			print_status(fd);
 			return 1;
 		}
 		printf("H2C sent %ld bytes to FPGA AXI 0x%llx\n",
 		       fsize, (unsigned long long)h2c.fpga_addr);
 		free(buf);
+		return print_status(fd);
+	} else if (!strcmp(argv[1], "status")) {
+		return print_status(fd);
 	} else {
 		usage(argv[0]);
 		return 1;
