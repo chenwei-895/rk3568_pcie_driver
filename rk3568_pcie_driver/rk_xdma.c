@@ -54,7 +54,7 @@ static unsigned int xdma_bar = 0;
 module_param(xdma_bar, uint, 0444);
 MODULE_PARM_DESC(xdma_bar, "BAR containing XDMA engine registers");
 
-static unsigned int user_bar = 2;
+static unsigned int user_bar = 1;
 module_param(user_bar, uint, 0444);
 MODULE_PARM_DESC(user_bar, "BAR containing FPGA user/control registers");
 
@@ -69,6 +69,10 @@ MODULE_PARM_DESC(default_timeout_ms, "Default DMA completion timeout in ms");
 static bool force_dma32 = true;
 module_param(force_dma32, bool, 0444);
 MODULE_PARM_DESC(force_dma32, "Force 32-bit coherent DMA addresses for RK PCIe bring-up");
+
+static bool strict_bar_check = false;
+module_param(strict_bar_check, bool, 0444);
+MODULE_PARM_DESC(strict_bar_check, "Fail probe if XDMA BAR reads as all ones");
 
 struct xdma_desc {
 	__le32 control;
@@ -130,6 +134,40 @@ static void xdma_engine_write(struct rk_xdma_dev *rxd, u32 reg, u32 val)
 static u32 xdma_engine_read(struct rk_xdma_dev *rxd, u32 reg)
 {
 	return ioread32(rxd->bar[xdma_bar] + XDMA_H2C_BASE(h2c_channel) + reg);
+}
+
+static u32 rk_xdma_bar_read32(struct rk_xdma_dev *rxd, unsigned int bar,
+			      u32 off)
+{
+	if (bar >= RK_XDMA_MAX_BARS || !rxd->bar[bar] ||
+	    off > rxd->bar_len[bar] || 4 > rxd->bar_len[bar] - off)
+		return U32_MAX;
+	return ioread32(rxd->bar[bar] + off);
+}
+
+static bool rk_xdma_bar_looks_dead(struct rk_xdma_dev *rxd, unsigned int bar)
+{
+	return rk_xdma_bar_read32(rxd, bar, 0x00) == U32_MAX &&
+	       rk_xdma_bar_read32(rxd, bar, XDMA_ENGINE_CONTROL) == U32_MAX &&
+	       rk_xdma_bar_read32(rxd, bar, XDMA_ENGINE_STATUS) == U32_MAX &&
+	       rk_xdma_bar_read32(rxd, bar, XDMA_COMPLETED_DESC) == U32_MAX;
+}
+
+static void rk_xdma_probe_bar_windows(struct rk_xdma_dev *rxd)
+{
+	unsigned int bar;
+
+	for (bar = 0; bar < RK_XDMA_MAX_BARS; bar++) {
+		if (!rxd->bar[bar])
+			continue;
+		dev_info(&rxd->pdev->dev,
+			 "BAR%u probe: [0]=0x%08x ctrl=0x%08x status=0x%08x completed=0x%08x first_desc_lo=0x%08x\n",
+			 bar, rk_xdma_bar_read32(rxd, bar, 0x00),
+			 rk_xdma_bar_read32(rxd, bar, XDMA_ENGINE_CONTROL),
+			 rk_xdma_bar_read32(rxd, bar, XDMA_ENGINE_STATUS),
+			 rk_xdma_bar_read32(rxd, bar, XDMA_COMPLETED_DESC),
+			 rk_xdma_bar_read32(rxd, bar, XDMA_FIRST_DESC_LO));
+	}
 }
 
 static void xdma_log_h2c_status(struct rk_xdma_dev *rxd, const char *tag)
@@ -456,6 +494,15 @@ static int rk_xdma_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	}
 	if (user_bar >= RK_XDMA_MAX_BARS || !rxd->bar[user_bar])
 		dev_warn(&pdev->dev, "user_bar=%u is not mapped\n", user_bar);
+
+	rk_xdma_probe_bar_windows(rxd);
+	if (rk_xdma_bar_looks_dead(rxd, xdma_bar)) {
+		dev_err(&pdev->dev,
+			"xdma_bar=%u reads all 0xffffffff; PCIe config/link is up but BAR MMIO is not responding. Check FPGA bitstream, XDMA BAR config, AXI clock/reset, and PERST timing.\n",
+			xdma_bar);
+		if (strict_bar_check)
+			return -ENODEV;
+	}
 
 	rxd->desc_virt = dma_alloc_coherent(&pdev->dev, sizeof(*rxd->desc_virt),
 					    &rxd->desc_dma, GFP_KERNEL);
