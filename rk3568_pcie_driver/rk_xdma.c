@@ -20,6 +20,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/pci.h>
+#include <linux/pci_regs.h>
 #include <linux/poll.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
@@ -64,6 +65,10 @@ MODULE_PARM_DESC(h2c_channel, "XDMA H2C channel index");
 static unsigned int default_timeout_ms = 1000;
 module_param(default_timeout_ms, uint, 0644);
 MODULE_PARM_DESC(default_timeout_ms, "Default DMA completion timeout in ms");
+
+static bool force_dma32 = true;
+module_param(force_dma32, bool, 0444);
+MODULE_PARM_DESC(force_dma32, "Force 32-bit coherent DMA addresses for RK PCIe bring-up");
 
 struct xdma_desc {
 	__le32 control;
@@ -127,6 +132,15 @@ static u32 xdma_engine_read(struct rk_xdma_dev *rxd, u32 reg)
 	return ioread32(rxd->bar[xdma_bar] + XDMA_H2C_BASE(h2c_channel) + reg);
 }
 
+static void xdma_log_h2c_status(struct rk_xdma_dev *rxd, const char *tag)
+{
+	rxd->last_h2c_status = xdma_engine_read(rxd, XDMA_ENGINE_STATUS);
+	rxd->last_h2c_completed = xdma_engine_read(rxd, XDMA_COMPLETED_DESC);
+	dev_info(&rxd->pdev->dev, "%s H2C%u status=0x%08x completed=%u\n",
+		 tag, h2c_channel, rxd->last_h2c_status,
+		 rxd->last_h2c_completed);
+}
+
 static int h2c_submit(struct rk_xdma_dev *rxd, u64 bytes, u64 fpga_addr,
 		      u32 timeout_ms)
 {
@@ -151,6 +165,10 @@ static int h2c_submit(struct rk_xdma_dev *rxd, u64 bytes, u64 fpga_addr,
 
 	dma_wmb();
 
+	xdma_engine_write(rxd, XDMA_ENGINE_CONTROL, 0);
+	udelay(10);
+	xdma_log_h2c_status(rxd, "before-submit");
+
 	before = xdma_engine_read(rxd, XDMA_COMPLETED_DESC);
 	xdma_engine_write(rxd, XDMA_FIRST_DESC_LO, lower_32_bits(rxd->desc_dma));
 	xdma_engine_write(rxd, XDMA_FIRST_DESC_HI, upper_32_bits(rxd->desc_dma));
@@ -172,6 +190,22 @@ static int h2c_submit(struct rk_xdma_dev *rxd, u64 bytes, u64 fpga_addr,
 	dev_err(&rxd->pdev->dev, "H2C timeout status=0x%08x completed=%u before=%u\n",
 		rxd->last_h2c_status, rxd->last_h2c_completed, before);
 	return -ETIMEDOUT;
+}
+
+static void rk_xdma_log_pcie_info(struct pci_dev *pdev)
+{
+	u16 lnksta = 0;
+	int ret;
+
+	dev_info(&pdev->dev, "PCI ID %04x:%04x subsystem %04x:%04x class=0x%06x irq=%d\n",
+		 pdev->vendor, pdev->device, pdev->subsystem_vendor,
+		 pdev->subsystem_device, pdev->class, pdev->irq);
+
+	ret = pcie_capability_read_word(pdev, PCI_EXP_LNKSTA, &lnksta);
+	if (!ret)
+		dev_info(&pdev->dev, "PCIe link status raw=0x%04x speed_code=%u width=x%u\n",
+			 lnksta, lnksta & PCI_EXP_LNKSTA_CLS,
+			 (lnksta & PCI_EXP_LNKSTA_NLW) >> 4);
 }
 
 static int rk_xdma_open(struct inode *inode, struct file *filp)
@@ -374,15 +408,26 @@ static int rk_xdma_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (ret)
 		return ret;
 
-	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
-	if (ret)
+	rk_xdma_log_pcie_info(pdev);
+
+	if (force_dma32)
 		ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
+	else {
+		ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
+		if (ret)
+			ret = dma_set_mask_and_coherent(&pdev->dev,
+							DMA_BIT_MASK(32));
+	}
 	if (ret)
 		return ret;
+	dev_info(&pdev->dev, "using %s coherent DMA mask\n",
+		 force_dma32 ? "32-bit forced" : "best available");
 
 	pci_set_master(pdev);
 
 	bars = pci_select_bars(pdev, IORESOURCE_MEM);
+	dev_info(&pdev->dev, "memory BAR mask=0x%x xdma_bar=%u user_bar=%u h2c_channel=%u\n",
+		 bars, xdma_bar, user_bar, h2c_channel);
 	ret = pcim_iomap_regions(pdev, bars, DRV_NAME);
 	if (ret)
 		return ret;
@@ -400,8 +445,9 @@ static int rk_xdma_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 			dev_err(&pdev->dev, "failed to map BAR%d\n", bar);
 			return -ENOMEM;
 		}
-		dev_info(&pdev->dev, "BAR%d mapped len=%pa\n", bar,
-			 &rxd->bar_len[bar]);
+		dev_info(&pdev->dev, "BAR%d mapped start=%pa len=%pa flags=0x%lx\n",
+			 bar, &pdev->resource[bar].start, &rxd->bar_len[bar],
+			 pci_resource_flags(pdev, bar));
 	}
 
 	if (xdma_bar >= RK_XDMA_MAX_BARS || !rxd->bar[xdma_bar]) {
@@ -415,6 +461,8 @@ static int rk_xdma_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 					    &rxd->desc_dma, GFP_KERNEL);
 	if (!rxd->desc_virt)
 		return -ENOMEM;
+	dev_info(&pdev->dev, "descriptor dma=%pad size=%zu\n", &rxd->desc_dma,
+		 sizeof(*rxd->desc_virt));
 
 	ret = alloc_chrdev_region(&rxd->devt, 0, 1, DRV_NAME);
 	if (ret)
