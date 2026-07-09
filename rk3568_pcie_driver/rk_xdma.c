@@ -30,7 +30,7 @@
 #include "rk_xdma_ioctl.h"
 
 #define DRV_NAME "rk3568-xdma"
-#define DRV_VERSION "2026-07-09-barcheck-v2"
+#define DRV_VERSION "2026-07-09-bar1msix-v3"
 #define RK_XDMA_MAX_BARS 6
 
 /*
@@ -70,6 +70,10 @@ MODULE_PARM_DESC(default_timeout_ms, "Default DMA completion timeout in ms");
 static bool force_dma32 = true;
 module_param(force_dma32, bool, 0444);
 MODULE_PARM_DESC(force_dma32, "Force 32-bit coherent DMA addresses for RK PCIe bring-up");
+
+static unsigned int bar1_msix_offset = 0x2000;
+module_param(bar1_msix_offset, uint, 0444);
+MODULE_PARM_DESC(bar1_msix_offset, "Byte offset within BAR1 reserved by MSI-X table+PBA (0=no MSI-X in BAR1, 0x2000=standard XDMA)");
 
 static bool strict_bar_check = false;
 module_param(strict_bar_check, bool, 0444);
@@ -313,12 +317,16 @@ static long rk_xdma_ioctl(struct file *filp, unsigned int cmd, unsigned long arg
 	switch (cmd) {
 	case RK_XDMA_IOC_BAR_READ: {
 		struct rk_xdma_bar_io io;
+		u64 real_off;
 
 		if (copy_from_user(&io, (void __user *)arg, sizeof(io))) {
 			ret = -EFAULT;
 			break;
 		}
-		addr = bar_ptr(rxd, io.bar, io.offset, io.width);
+		real_off = io.offset;
+		if (io.bar == 1 && bar1_msix_offset)
+			real_off += bar1_msix_offset;
+		addr = bar_ptr(rxd, io.bar, real_off, io.width);
 		if (!addr) {
 			ret = -EINVAL;
 			break;
@@ -335,12 +343,16 @@ static long rk_xdma_ioctl(struct file *filp, unsigned int cmd, unsigned long arg
 	}
 	case RK_XDMA_IOC_BAR_WRITE: {
 		struct rk_xdma_bar_io io;
+		u64 real_off;
 
 		if (copy_from_user(&io, (void __user *)arg, sizeof(io))) {
 			ret = -EFAULT;
 			break;
 		}
-		addr = bar_ptr(rxd, io.bar, io.offset, io.width);
+		real_off = io.offset;
+		if (io.bar == 1 && bar1_msix_offset)
+			real_off += bar1_msix_offset;
+		addr = bar_ptr(rxd, io.bar, real_off, io.width);
 		if (!addr) {
 			ret = -EINVAL;
 			break;
@@ -467,8 +479,8 @@ static int rk_xdma_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	pci_set_master(pdev);
 
 	bars = pci_select_bars(pdev, IORESOURCE_MEM);
-	dev_info(&pdev->dev, "memory BAR mask=0x%x xdma_bar=%u user_bar=%u h2c_channel=%u\n",
-		 bars, xdma_bar, user_bar, h2c_channel);
+	dev_info(&pdev->dev, "memory BAR mask=0x%x xdma_bar=%u user_bar=%u h2c_channel=%u bar1_msix_offset=0x%x\n",
+		 bars, xdma_bar, user_bar, h2c_channel, bar1_msix_offset);
 	ret = pcim_iomap_regions(pdev, bars, DRV_NAME);
 	if (ret)
 		return ret;
