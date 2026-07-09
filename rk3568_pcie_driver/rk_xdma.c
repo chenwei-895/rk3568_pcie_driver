@@ -30,6 +30,7 @@
 #include "rk_xdma_ioctl.h"
 
 #define DRV_NAME "rk3568-xdma"
+#define DRV_VERSION "2026-07-09-barcheck-v2"
 #define RK_XDMA_MAX_BARS 6
 
 /*
@@ -73,6 +74,8 @@ MODULE_PARM_DESC(force_dma32, "Force 32-bit coherent DMA addresses for RK PCIe b
 static bool strict_bar_check = false;
 module_param(strict_bar_check, bool, 0444);
 MODULE_PARM_DESC(strict_bar_check, "Fail probe if XDMA BAR reads as all ones");
+
+static int rk_xdma_bound_devices;
 
 struct xdma_desc {
 	__le32 control;
@@ -541,6 +544,7 @@ static int rk_xdma_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	dev_info(&pdev->dev, "RK3568 XDMA endpoint ready: /dev/rk_xdma%d\n",
 		 MINOR(rxd->devt));
+	rk_xdma_bound_devices++;
 	return 0;
 
 err_class:
@@ -569,6 +573,7 @@ static void rk_xdma_remove(struct pci_dev *pdev)
 				  rxd->buf_dma);
 	dma_free_coherent(&pdev->dev, sizeof(*rxd->desc_virt), rxd->desc_virt,
 			  rxd->desc_dma);
+	rk_xdma_bound_devices--;
 }
 
 static const struct pci_device_id rk_xdma_ids[] = {
@@ -584,8 +589,35 @@ static struct pci_driver rk_xdma_pci_driver = {
 	.remove = rk_xdma_remove,
 };
 
-module_pci_driver(rk_xdma_pci_driver);
+static int __init rk_xdma_init(void)
+{
+	int ret;
+
+	rk_xdma_bound_devices = 0;
+	pr_info(DRV_NAME ": loading version %s strict_bar_check=%d\n",
+		DRV_VERSION, strict_bar_check);
+	ret = pci_register_driver(&rk_xdma_pci_driver);
+	if (ret)
+		return ret;
+
+	if (strict_bar_check && !rk_xdma_bound_devices) {
+		pci_unregister_driver(&rk_xdma_pci_driver);
+		pr_err(DRV_NAME ": strict_bar_check requested, but no XDMA endpoint passed BAR probing\n");
+		return -ENODEV;
+	}
+
+	return 0;
+}
+
+static void __exit rk_xdma_exit(void)
+{
+	pci_unregister_driver(&rk_xdma_pci_driver);
+}
+
+module_init(rk_xdma_init);
+module_exit(rk_xdma_exit);
 
 MODULE_AUTHOR("Codex");
 MODULE_DESCRIPTION("RK3568 ARM PCIe host driver for Xilinx XDMA FPGA endpoint");
+MODULE_VERSION(DRV_VERSION);
 MODULE_LICENSE("GPL");
