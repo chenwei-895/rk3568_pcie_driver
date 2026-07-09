@@ -47,8 +47,9 @@ static void usage(const char *prog)
 		"  %s status\n"
 		"\n"
 		"Current zcu106_audio BD map:\n"
-		"  user_bar default is BAR1; offset 0 should reach FPGA AXI 0x44a00000 BRAM\n"
-		"  H2C video DDR destination should start at FPGA AXI 0x80000000\n",
+		"  user_bar default is BAR1; offset 0 -> FPGA AXI 0x44a00000 BRAM (driver auto-adds MSI-X offset)\n"
+		"  H2C DMA DDR destination starts at FPGA AXI 0x00000000 (2 GB DDR4 space)\n"
+		"  Module param: bar1_msix_offset=0x2000 (BAR1 MSI-X table+PBA overhead)\n",
 		prog, prog, prog, prog, prog);
 }
 
@@ -73,6 +74,9 @@ static int bar_scan(int fd)
 {
 	static const uint64_t offsets[] = {
 		0x00, 0x04, 0x40, 0x48, 0x80, 0x84, 0x88,
+	};
+	static const uint64_t bar1_extra[] = {
+		0x2000, 0x2004,
 	};
 	unsigned int bar, i;
 
@@ -101,6 +105,21 @@ static int bar_scan(int fd)
 			printf("  -> mapped, but every sampled register is 0xffffffff; BAR MMIO is not responding\n");
 		else if (!ok)
 			printf("  -> not mapped by driver or invalid BAR\n");
+
+		if (bar == 1) {
+			printf("  BAR1 MSI-X adjusted window (offset +0x2000):\n");
+			for (i = 0; i < sizeof(bar1_extra) / sizeof(bar1_extra[0]); i++) {
+				uint32_t value = 0;
+				if (bar_read32(fd, bar, bar1_extra[i], &value)) {
+					printf("    [0x%04llx] ERR %s\n",
+					       (unsigned long long)bar1_extra[i],
+					       strerror(errno));
+				} else {
+					printf("    [0x%04llx] 0x%08x\n",
+					       (unsigned long long)bar1_extra[i], value);
+				}
+			}
+		}
 	}
 
 	return 0;
