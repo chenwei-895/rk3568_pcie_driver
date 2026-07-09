@@ -503,6 +503,11 @@ static int rk_xdma_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		if (strict_bar_check)
 			return -ENODEV;
 	}
+	if (user_bar < RK_XDMA_MAX_BARS && rxd->bar[user_bar] &&
+	    user_bar != xdma_bar && rk_xdma_bar_looks_dead(rxd, user_bar))
+		dev_warn(&pdev->dev,
+			 "user_bar=%u also reads all 0xffffffff; control BRAM BAR is not reachable from RK PCIe MMIO.\n",
+			 user_bar);
 
 	rxd->desc_virt = dma_alloc_coherent(&pdev->dev, sizeof(*rxd->desc_virt),
 					    &rxd->desc_dma, GFP_KERNEL);
