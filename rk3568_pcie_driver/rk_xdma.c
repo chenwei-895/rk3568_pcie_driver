@@ -30,7 +30,7 @@
 #include "rk_xdma_ioctl.h"
 
 #define DRV_NAME "rk3568-xdma"
-#define DRV_VERSION "2026-07-10-zcu106-bar-map-v4"
+#define DRV_VERSION "2026-07-10-xdma-start-seq-v5"
 #define RK_XDMA_MAX_BARS 6
 
 /*
@@ -40,16 +40,53 @@
  */
 #define XDMA_H2C_BASE(ch)          (0x0000 + (ch) * 0x100)
 #define XDMA_ENGINE_CONTROL        0x04
+#define XDMA_ENGINE_CONTROL_W1S    0x08
+#define XDMA_ENGINE_CONTROL_W1C    0x0c
 #define XDMA_ENGINE_STATUS         0x40
+#define XDMA_ENGINE_STATUS_RC      0x44
 #define XDMA_COMPLETED_DESC        0x48
+#define XDMA_ENGINE_ALIGNMENTS     0x4c
 #define XDMA_FIRST_DESC_LO         0x80
 #define XDMA_FIRST_DESC_HI         0x84
 #define XDMA_FIRST_DESC_ADJACENT   0x88
 
 #define XDMA_CTRL_RUN_STOP         BIT(0)
+#define XDMA_CTRL_IE_DESC_STOPPED  BIT(1)
+#define XDMA_CTRL_IE_DESC_COMPLETED BIT(2)
+#define XDMA_CTRL_IE_ALIGN_MISMATCH BIT(3)
+#define XDMA_CTRL_IE_MAGIC_STOPPED BIT(4)
+#define XDMA_CTRL_IE_READ_ERROR    GENMASK(13, 9)
+#define XDMA_CTRL_IE_DESC_ERROR    GENMASK(23, 19)
+#define XDMA_CTRL_EVENT_MASK       (XDMA_CTRL_IE_DESC_STOPPED | \
+				    XDMA_CTRL_IE_DESC_COMPLETED | \
+				    XDMA_CTRL_IE_ALIGN_MISMATCH | \
+				    XDMA_CTRL_IE_MAGIC_STOPPED | \
+				    XDMA_CTRL_IE_READ_ERROR | \
+				    XDMA_CTRL_IE_DESC_ERROR)
+#define XDMA_CTRL_START            (XDMA_CTRL_RUN_STOP | XDMA_CTRL_EVENT_MASK)
+
+#define XDMA_STAT_BUSY             BIT(0)
+#define XDMA_STAT_DESC_STOPPED     BIT(1)
+#define XDMA_STAT_DESC_COMPLETED   BIT(2)
+#define XDMA_STAT_ALIGN_MISMATCH   BIT(3)
+#define XDMA_STAT_MAGIC_STOPPED    BIT(4)
+#define XDMA_STAT_INVALID_LEN      BIT(5)
+#define XDMA_STAT_H2C_READ_ERROR   GENMASK(13, 9)
+#define XDMA_STAT_H2C_WRITE_ERROR  GENMASK(15, 14)
+#define XDMA_STAT_DESC_ERROR       GENMASK(23, 19)
+#define XDMA_STAT_ERROR_MASK       (XDMA_STAT_ALIGN_MISMATCH | \
+				    XDMA_STAT_MAGIC_STOPPED | \
+				    XDMA_STAT_INVALID_LEN | \
+				    XDMA_STAT_H2C_READ_ERROR | \
+				    XDMA_STAT_H2C_WRITE_ERROR | \
+				    XDMA_STAT_DESC_ERROR)
+
 #define XDMA_DESC_MAGIC            0xad4b0000u
 #define XDMA_DESC_STOP             BIT(0)
+#define XDMA_DESC_COMPLETED        BIT(1)
 #define XDMA_DESC_EOP              BIT(4)
+#define XDMA_ID_MASK               0xffff0000u
+#define XDMA_ID_H2C                0x1fc00000u
 
 /* Current zcu106_audio XDMA mapping: BAR1 is the internal DMA engine. */
 static unsigned int xdma_bar = 1;
@@ -145,6 +182,13 @@ static u32 xdma_engine_read(struct rk_xdma_dev *rxd, u32 reg)
 	return ioread32(rxd->bar[xdma_bar] + XDMA_H2C_BASE(h2c_channel) + reg);
 }
 
+static void xdma_engine_stop(struct rk_xdma_dev *rxd)
+{
+	/* A read from the same engine flushes PCIe posted MMIO writes. */
+	xdma_engine_write(rxd, XDMA_ENGINE_CONTROL, XDMA_CTRL_EVENT_MASK);
+	(void)xdma_engine_read(rxd, XDMA_ENGINE_STATUS);
+}
+
 static u32 rk_xdma_bar_read32(struct rk_xdma_dev *rxd, unsigned int bar,
 			      u32 off)
 {
@@ -181,18 +225,40 @@ static void rk_xdma_probe_bar_windows(struct rk_xdma_dev *rxd)
 
 static void xdma_log_h2c_status(struct rk_xdma_dev *rxd, const char *tag)
 {
+	u32 control;
+
+	control = xdma_engine_read(rxd, XDMA_ENGINE_CONTROL);
 	rxd->last_h2c_status = xdma_engine_read(rxd, XDMA_ENGINE_STATUS);
 	rxd->last_h2c_completed = xdma_engine_read(rxd, XDMA_COMPLETED_DESC);
-	dev_info(&rxd->pdev->dev, "%s H2C%u status=0x%08x completed=%u\n",
-		 tag, h2c_channel, rxd->last_h2c_status,
+	dev_info(&rxd->pdev->dev,
+		 "%s H2C%u control=0x%08x status=0x%08x completed=%u\n",
+		 tag, h2c_channel, control, rxd->last_h2c_status,
 		 rxd->last_h2c_completed);
+}
+
+static void xdma_log_h2c_error(struct rk_xdma_dev *rxd, const char *tag,
+			       u32 status)
+{
+	dev_err(&rxd->pdev->dev,
+		"%s H2C%u status=0x%08x busy=%u stopped=%u completed=%u align=%u magic=%u invalid_len=%u read_err=0x%x write_err=0x%x desc_err=0x%x\n",
+		tag, h2c_channel, status, !!(status & XDMA_STAT_BUSY),
+		!!(status & XDMA_STAT_DESC_STOPPED),
+		!!(status & XDMA_STAT_DESC_COMPLETED),
+		!!(status & XDMA_STAT_ALIGN_MISMATCH),
+		!!(status & XDMA_STAT_MAGIC_STOPPED),
+		!!(status & XDMA_STAT_INVALID_LEN),
+		(status & XDMA_STAT_H2C_READ_ERROR) >> 9,
+		(status & XDMA_STAT_H2C_WRITE_ERROR) >> 14,
+		(status & XDMA_STAT_DESC_ERROR) >> 19);
 }
 
 static int h2c_submit(struct rk_xdma_dev *rxd, u64 bytes, u64 fpga_addr,
 		      u32 timeout_ms)
 {
 	ktime_t deadline;
-	u32 before;
+	u32 before, control, status;
+	u32 desc_lo, desc_hi, desc_adjacent;
+	int ret = -ETIMEDOUT;
 
 	if (!rxd->bar[xdma_bar])
 		return -ENODEV;
@@ -203,7 +269,7 @@ static int h2c_submit(struct rk_xdma_dev *rxd, u64 bytes, u64 fpga_addr,
 
 	memset(rxd->desc_virt, 0, sizeof(*rxd->desc_virt));
 	rxd->desc_virt->control = cpu_to_le32(XDMA_DESC_MAGIC | XDMA_DESC_STOP |
-					      XDMA_DESC_EOP);
+					      XDMA_DESC_COMPLETED | XDMA_DESC_EOP);
 	rxd->desc_virt->bytes = cpu_to_le32((u32)bytes);
 	rxd->desc_virt->src_addr_lo = cpu_to_le32(lower_32_bits(rxd->buf_dma));
 	rxd->desc_virt->src_addr_hi = cpu_to_le32(upper_32_bits(rxd->buf_dma));
@@ -212,15 +278,50 @@ static int h2c_submit(struct rk_xdma_dev *rxd, u64 bytes, u64 fpga_addr,
 
 	dma_wmb();
 
-	xdma_engine_write(rxd, XDMA_ENGINE_CONTROL, 0);
+	/* Stop a previous timed-out run and clear only stale status events. */
+	xdma_engine_stop(rxd);
 	udelay(10);
 	xdma_log_h2c_status(rxd, "before-submit");
+	if (rxd->last_h2c_status)
+		(void)xdma_engine_read(rxd, XDMA_ENGINE_STATUS_RC);
 
 	before = xdma_engine_read(rxd, XDMA_COMPLETED_DESC);
 	xdma_engine_write(rxd, XDMA_FIRST_DESC_LO, lower_32_bits(rxd->desc_dma));
 	xdma_engine_write(rxd, XDMA_FIRST_DESC_HI, upper_32_bits(rxd->desc_dma));
 	xdma_engine_write(rxd, XDMA_FIRST_DESC_ADJACENT, 0);
-	xdma_engine_write(rxd, XDMA_ENGINE_CONTROL, XDMA_CTRL_RUN_STOP);
+
+	/* Preserve ordering between descriptor pointer writes and RUN_STOP. */
+	wmb();
+	(void)xdma_engine_read(rxd, XDMA_ENGINE_STATUS);
+	desc_lo = xdma_engine_read(rxd, XDMA_FIRST_DESC_LO);
+	desc_hi = xdma_engine_read(rxd, XDMA_FIRST_DESC_HI);
+	desc_adjacent = xdma_engine_read(rxd, XDMA_FIRST_DESC_ADJACENT);
+	dev_info(&rxd->pdev->dev,
+		 "H2C%u descriptor dma=%pad ctrl=0x%08x bytes=%u src=0x%08x%08x dst=0x%08x%08x first_desc=0x%08x%08x adjacent=%u alignments=0x%08x\n",
+		 h2c_channel, &rxd->desc_dma,
+		 le32_to_cpu(rxd->desc_virt->control),
+		 le32_to_cpu(rxd->desc_virt->bytes),
+		 le32_to_cpu(rxd->desc_virt->src_addr_hi),
+		 le32_to_cpu(rxd->desc_virt->src_addr_lo),
+		 le32_to_cpu(rxd->desc_virt->dst_addr_hi),
+		 le32_to_cpu(rxd->desc_virt->dst_addr_lo),
+		 desc_hi, desc_lo, desc_adjacent,
+		 xdma_engine_read(rxd, XDMA_ENGINE_ALIGNMENTS));
+
+	xdma_engine_write(rxd, XDMA_ENGINE_CONTROL, XDMA_CTRL_START);
+	control = xdma_engine_read(rxd, XDMA_ENGINE_CONTROL);
+	status = xdma_engine_read(rxd, XDMA_ENGINE_STATUS);
+	rxd->last_h2c_completed = xdma_engine_read(rxd, XDMA_COMPLETED_DESC);
+	dev_info(&rxd->pdev->dev,
+		 "start-submit H2C%u control_write=0x%08x control_read=0x%08x status=0x%08x completed=%u before=%u\n",
+		 h2c_channel, (u32)XDMA_CTRL_START, control, status,
+		 rxd->last_h2c_completed, before);
+	if (!(control & XDMA_CTRL_RUN_STOP)) {
+		dev_err(&rxd->pdev->dev,
+			"H2C%u RUN_STOP did not latch; control=0x%08x\n",
+			h2c_channel, control);
+		return -EIO;
+	}
 
 	if (!timeout_ms)
 		timeout_ms = default_timeout_ms;
@@ -229,14 +330,38 @@ static int h2c_submit(struct rk_xdma_dev *rxd, u64 bytes, u64 fpga_addr,
 	do {
 		rxd->last_h2c_status = xdma_engine_read(rxd, XDMA_ENGINE_STATUS);
 		rxd->last_h2c_completed = xdma_engine_read(rxd, XDMA_COMPLETED_DESC);
-		if (rxd->last_h2c_completed != before)
-			return 0;
+		if (rxd->last_h2c_completed != before) {
+			ret = 0;
+			break;
+		}
+		if (rxd->last_h2c_status & XDMA_STAT_ERROR_MASK) {
+			ret = -EIO;
+			break;
+		}
 		usleep_range(50, 100);
 	} while (ktime_before(ktime_get(), deadline));
 
-	dev_err(&rxd->pdev->dev, "H2C timeout status=0x%08x completed=%u before=%u\n",
-		rxd->last_h2c_status, rxd->last_h2c_completed, before);
-	return -ETIMEDOUT;
+	control = xdma_engine_read(rxd, XDMA_ENGINE_CONTROL);
+	desc_lo = xdma_engine_read(rxd, XDMA_FIRST_DESC_LO);
+	desc_hi = xdma_engine_read(rxd, XDMA_FIRST_DESC_HI);
+	desc_adjacent = xdma_engine_read(rxd, XDMA_FIRST_DESC_ADJACENT);
+	if (!ret) {
+		dev_info(&rxd->pdev->dev,
+			 "H2C complete status=0x%08x completed=%u before=%u control=0x%08x\n",
+			 rxd->last_h2c_status, rxd->last_h2c_completed,
+			 before, control);
+	} else {
+		xdma_log_h2c_error(rxd,
+			ret == -ETIMEDOUT ? "H2C-timeout" : "H2C-error",
+			rxd->last_h2c_status);
+		dev_err(&rxd->pdev->dev,
+			"H2C final completed=%u before=%u control=0x%08x first_desc=0x%08x%08x adjacent=%u\n",
+			rxd->last_h2c_completed, before, control, desc_hi,
+			desc_lo, desc_adjacent);
+	}
+
+	xdma_engine_stop(rxd);
+	return ret;
 }
 
 static void rk_xdma_log_pcie_info(struct pci_dev *pdev)
@@ -448,6 +573,8 @@ static int rk_xdma_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	struct rk_xdma_dev *rxd;
 	void __iomem * const *iomap_table;
+	u16 pci_command;
+	u32 engine_id;
 	int bars;
 	int bar, ret;
 
@@ -479,6 +606,11 @@ static int rk_xdma_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		 force_dma32 ? "32-bit forced" : "best available");
 
 	pci_set_master(pdev);
+	pci_read_config_word(pdev, PCI_COMMAND, &pci_command);
+	dev_info(&pdev->dev,
+		 "PCI command after pci_set_master=0x%04x memory=%u bus_master=%u\n",
+		 pci_command, !!(pci_command & PCI_COMMAND_MEMORY),
+		 !!(pci_command & PCI_COMMAND_MASTER));
 
 	bars = pci_select_bars(pdev, IORESOURCE_MEM);
 	dev_info(&pdev->dev, "memory BAR mask=0x%x xdma_bar=%u user_bar=%u h2c_channel=%u bar1_msix_offset=0x%x\n",
@@ -513,6 +645,18 @@ static int rk_xdma_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		dev_warn(&pdev->dev, "user_bar=%u is not mapped\n", user_bar);
 
 	rk_xdma_probe_bar_windows(rxd);
+	engine_id = xdma_engine_read(rxd, 0x00);
+	dev_info(&pdev->dev,
+		 "selected XDMA H2C%u engine id=0x%08x alignments=0x%08x\n",
+		 h2c_channel, engine_id,
+		 xdma_engine_read(rxd, XDMA_ENGINE_ALIGNMENTS));
+	if ((engine_id & XDMA_ID_MASK) != XDMA_ID_H2C) {
+		dev_err(&pdev->dev,
+			"BAR%u offset 0x%x is not an H2C engine: id=0x%08x expected upper16=0x1fc0\n",
+			xdma_bar, XDMA_H2C_BASE(h2c_channel), engine_id);
+		if (strict_bar_check)
+			return -ENODEV;
+	}
 	if (rk_xdma_bar_looks_dead(rxd, xdma_bar)) {
 		dev_err(&pdev->dev,
 			"xdma_bar=%u reads all 0xffffffff; PCIe config/link is up but BAR MMIO is not responding. Check FPGA bitstream, XDMA BAR config, AXI clock/reset, and PERST timing.\n",
