@@ -30,7 +30,7 @@
 #include "rk_xdma_ioctl.h"
 
 #define DRV_NAME "rk3568-xdma"
-#define DRV_VERSION "2026-07-09-bar1msix-v3"
+#define DRV_VERSION "2026-07-10-zcu106-bar-map-v4"
 #define RK_XDMA_MAX_BARS 6
 
 /*
@@ -51,11 +51,13 @@
 #define XDMA_DESC_STOP             BIT(0)
 #define XDMA_DESC_EOP              BIT(4)
 
-static unsigned int xdma_bar = 0;
+/* Current zcu106_audio XDMA mapping: BAR1 is the internal DMA engine. */
+static unsigned int xdma_bar = 1;
 module_param(xdma_bar, uint, 0444);
 MODULE_PARM_DESC(xdma_bar, "BAR containing XDMA engine registers");
 
-static unsigned int user_bar = 1;
+/* Current zcu106_audio XDMA mapping: BAR0 is the external AXI-Lite master. */
+static unsigned int user_bar = 0;
 module_param(user_bar, uint, 0444);
 MODULE_PARM_DESC(user_bar, "BAR containing FPGA user/control registers");
 
@@ -71,9 +73,9 @@ static bool force_dma32 = true;
 module_param(force_dma32, bool, 0444);
 MODULE_PARM_DESC(force_dma32, "Force 32-bit coherent DMA addresses for RK PCIe bring-up");
 
-static unsigned int bar1_msix_offset = 0x2000;
+static unsigned int bar1_msix_offset;
 module_param(bar1_msix_offset, uint, 0444);
-MODULE_PARM_DESC(bar1_msix_offset, "Byte offset within BAR1 reserved by MSI-X table+PBA (0=no MSI-X in BAR1, 0x2000=standard XDMA)");
+MODULE_PARM_DESC(bar1_msix_offset, "Optional BAR1 MSI-X table/PBA offset; current zcu106_audio image has MSI-X disabled, so keep 0");
 
 static bool strict_bar_check = false;
 module_param(strict_bar_check, bool, 0444);
@@ -589,7 +591,7 @@ static void rk_xdma_remove(struct pci_dev *pdev)
 }
 
 static const struct pci_device_id rk_xdma_ids[] = {
-	{ PCI_DEVICE(0x10ee, PCI_ANY_ID) },
+	{ PCI_DEVICE(0x10ee, 0x9012) },
 	{ 0, }
 };
 MODULE_DEVICE_TABLE(pci, rk_xdma_ids);
@@ -617,6 +619,8 @@ static int __init rk_xdma_init(void)
 		pr_err(DRV_NAME ": strict_bar_check requested, but no XDMA endpoint passed BAR probing\n");
 		return -ENODEV;
 	}
+	if (!rk_xdma_bound_devices)
+		pr_warn(DRV_NAME ": no matching 10ee:9012 endpoint found; check lspci and PCIe link/reset\n");
 
 	return 0;
 }
