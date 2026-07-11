@@ -30,7 +30,7 @@
 #include "rk_xdma_ioctl.h"
 
 #define DRV_NAME "rk3568-xdma"
-#define DRV_VERSION "2026-07-10-xdma-start-seq-v5"
+#define DRV_VERSION "2026-07-11-xdma-sgdma-offset-v6"
 #define RK_XDMA_MAX_BARS 6
 
 /*
@@ -39,6 +39,7 @@
  * module parameters below instead of touching user code.
  */
 #define XDMA_H2C_BASE(ch)          (0x0000 + (ch) * 0x100)
+#define XDMA_H2C_SGDMA_BASE(ch)    (0x4000 + (ch) * 0x100)
 #define XDMA_ENGINE_CONTROL        0x04
 #define XDMA_ENGINE_CONTROL_W1S    0x08
 #define XDMA_ENGINE_CONTROL_W1C    0x0c
@@ -182,6 +183,17 @@ static u32 xdma_engine_read(struct rk_xdma_dev *rxd, u32 reg)
 	return ioread32(rxd->bar[xdma_bar] + XDMA_H2C_BASE(h2c_channel) + reg);
 }
 
+static void xdma_sgdma_write(struct rk_xdma_dev *rxd, u32 reg, u32 val)
+{
+	iowrite32(val, rxd->bar[xdma_bar] + XDMA_H2C_SGDMA_BASE(h2c_channel) + reg);
+}
+
+static u32 xdma_sgdma_read(struct rk_xdma_dev *rxd, u32 reg)
+{
+	return ioread32(rxd->bar[xdma_bar] +
+			 XDMA_H2C_SGDMA_BASE(h2c_channel) + reg);
+}
+
 static void xdma_engine_stop(struct rk_xdma_dev *rxd)
 {
 	/* A read from the same engine flushes PCIe posted MMIO writes. */
@@ -214,12 +226,16 @@ static void rk_xdma_probe_bar_windows(struct rk_xdma_dev *rxd)
 		if (!rxd->bar[bar])
 			continue;
 		dev_info(&rxd->pdev->dev,
-			 "BAR%u probe: [0]=0x%08x ctrl=0x%08x status=0x%08x completed=0x%08x first_desc_lo=0x%08x\n",
+			 "BAR%u probe: [0]=0x%08x ctrl=0x%08x status=0x%08x completed=0x%08x sgdma_id=0x%08x first_desc_lo=0x%08x\n",
 			 bar, rk_xdma_bar_read32(rxd, bar, 0x00),
 			 rk_xdma_bar_read32(rxd, bar, XDMA_ENGINE_CONTROL),
 			 rk_xdma_bar_read32(rxd, bar, XDMA_ENGINE_STATUS),
 			 rk_xdma_bar_read32(rxd, bar, XDMA_COMPLETED_DESC),
-			 rk_xdma_bar_read32(rxd, bar, XDMA_FIRST_DESC_LO));
+			 rk_xdma_bar_read32(rxd, bar,
+				XDMA_H2C_SGDMA_BASE(h2c_channel)),
+			 rk_xdma_bar_read32(rxd, bar,
+				XDMA_H2C_SGDMA_BASE(h2c_channel) +
+				XDMA_FIRST_DESC_LO));
 	}
 }
 
@@ -286,16 +302,16 @@ static int h2c_submit(struct rk_xdma_dev *rxd, u64 bytes, u64 fpga_addr,
 		(void)xdma_engine_read(rxd, XDMA_ENGINE_STATUS_RC);
 
 	before = xdma_engine_read(rxd, XDMA_COMPLETED_DESC);
-	xdma_engine_write(rxd, XDMA_FIRST_DESC_LO, lower_32_bits(rxd->desc_dma));
-	xdma_engine_write(rxd, XDMA_FIRST_DESC_HI, upper_32_bits(rxd->desc_dma));
-	xdma_engine_write(rxd, XDMA_FIRST_DESC_ADJACENT, 0);
+	xdma_sgdma_write(rxd, XDMA_FIRST_DESC_LO, lower_32_bits(rxd->desc_dma));
+	xdma_sgdma_write(rxd, XDMA_FIRST_DESC_HI, upper_32_bits(rxd->desc_dma));
+	xdma_sgdma_write(rxd, XDMA_FIRST_DESC_ADJACENT, 0);
 
 	/* Preserve ordering between descriptor pointer writes and RUN_STOP. */
 	wmb();
 	(void)xdma_engine_read(rxd, XDMA_ENGINE_STATUS);
-	desc_lo = xdma_engine_read(rxd, XDMA_FIRST_DESC_LO);
-	desc_hi = xdma_engine_read(rxd, XDMA_FIRST_DESC_HI);
-	desc_adjacent = xdma_engine_read(rxd, XDMA_FIRST_DESC_ADJACENT);
+	desc_lo = xdma_sgdma_read(rxd, XDMA_FIRST_DESC_LO);
+	desc_hi = xdma_sgdma_read(rxd, XDMA_FIRST_DESC_HI);
+	desc_adjacent = xdma_sgdma_read(rxd, XDMA_FIRST_DESC_ADJACENT);
 	dev_info(&rxd->pdev->dev,
 		 "H2C%u descriptor dma=%pad ctrl=0x%08x bytes=%u src=0x%08x%08x dst=0x%08x%08x first_desc=0x%08x%08x adjacent=%u alignments=0x%08x\n",
 		 h2c_channel, &rxd->desc_dma,
@@ -342,9 +358,9 @@ static int h2c_submit(struct rk_xdma_dev *rxd, u64 bytes, u64 fpga_addr,
 	} while (ktime_before(ktime_get(), deadline));
 
 	control = xdma_engine_read(rxd, XDMA_ENGINE_CONTROL);
-	desc_lo = xdma_engine_read(rxd, XDMA_FIRST_DESC_LO);
-	desc_hi = xdma_engine_read(rxd, XDMA_FIRST_DESC_HI);
-	desc_adjacent = xdma_engine_read(rxd, XDMA_FIRST_DESC_ADJACENT);
+	desc_lo = xdma_sgdma_read(rxd, XDMA_FIRST_DESC_LO);
+	desc_hi = xdma_sgdma_read(rxd, XDMA_FIRST_DESC_HI);
+	desc_adjacent = xdma_sgdma_read(rxd, XDMA_FIRST_DESC_ADJACENT);
 	if (!ret) {
 		dev_info(&rxd->pdev->dev,
 			 "H2C complete status=0x%08x completed=%u before=%u control=0x%08x\n",
@@ -641,14 +657,25 @@ static int rk_xdma_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		dev_err(&pdev->dev, "xdma_bar=%u is not mapped\n", xdma_bar);
 		return -EINVAL;
 	}
+	if (rxd->bar_len[xdma_bar] <
+	    XDMA_H2C_SGDMA_BASE(h2c_channel) + XDMA_FIRST_DESC_ADJACENT + 4) {
+		dev_err(&pdev->dev,
+			"BAR%u length 0x%llx does not cover H2C%u SGDMA registers through 0x%x\n",
+			xdma_bar, (unsigned long long)rxd->bar_len[xdma_bar],
+			h2c_channel,
+			XDMA_H2C_SGDMA_BASE(h2c_channel) +
+			XDMA_FIRST_DESC_ADJACENT);
+		return -EINVAL;
+	}
 	if (user_bar >= RK_XDMA_MAX_BARS || !rxd->bar[user_bar])
 		dev_warn(&pdev->dev, "user_bar=%u is not mapped\n", user_bar);
 
 	rk_xdma_probe_bar_windows(rxd);
 	engine_id = xdma_engine_read(rxd, 0x00);
 	dev_info(&pdev->dev,
-		 "selected XDMA H2C%u engine id=0x%08x alignments=0x%08x\n",
+		 "selected XDMA H2C%u engine id=0x%08x sgdma_id=0x%08x alignments=0x%08x\n",
 		 h2c_channel, engine_id,
+		 xdma_sgdma_read(rxd, 0x00),
 		 xdma_engine_read(rxd, XDMA_ENGINE_ALIGNMENTS));
 	if ((engine_id & XDMA_ID_MASK) != XDMA_ID_H2C) {
 		dev_err(&pdev->dev,
