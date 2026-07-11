@@ -73,10 +73,13 @@ static int print_status(int fd)
 static int bar_scan(int fd)
 {
 	static const uint64_t offsets[] = {
-		0x00, 0x04, 0x40, 0x48, 0x80, 0x84, 0x88,
+		0x00, 0x04, 0x08, 0x0c, 0x40, 0x48, 0x4c,
 	};
 	static const uint64_t bar0_extra[] = {
 		0x40000, 0x40004,
+	};
+	static const uint64_t bar1_sgdma[] = {
+		0x4000, 0x4080, 0x4084, 0x4088,
 	};
 	unsigned int bar, i;
 
@@ -117,6 +120,20 @@ static int bar_scan(int fd)
 				} else {
 					printf("    [0x%04llx] 0x%08x\n",
 						(unsigned long long)bar0_extra[i], value);
+				}
+			}
+		}
+		if (bar == 1) {
+			printf("  BAR1 H2C0 SGDMA descriptor window:\n");
+			for (i = 0; i < sizeof(bar1_sgdma) / sizeof(bar1_sgdma[0]); i++) {
+				uint32_t value = 0;
+				if (bar_read32(fd, bar, bar1_sgdma[i], &value)) {
+					printf("    [0x%04llx] ERR %s\n",
+					       (unsigned long long)bar1_sgdma[i],
+					       strerror(errno));
+				} else {
+					printf("    [0x%04llx] 0x%08x\n",
+					       (unsigned long long)bar1_sgdma[i], value);
 				}
 			}
 		}
